@@ -12,6 +12,8 @@ class Settings:
     model: str
     base_url: str
     num_ctx: int
+    num_predict: int
+    timeout_seconds: int
     max_files: int
     max_file_chars: int
     max_total_chars: int
@@ -28,9 +30,11 @@ def load_settings() -> Settings:
         model=os.getenv("AGENT_MODEL", "qwen2.5-coder:7b"),
         base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
         num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "16384")),
+        num_predict=int(os.getenv("OLLAMA_NUM_PREDICT", "4096")),
+        timeout_seconds=int(os.getenv("AGENT_TIMEOUT", "180")),
         max_files=int(os.getenv("MAX_FILES", "250")),
         max_file_chars=int(os.getenv("MAX_FILE_CHARS", "12000")),
-        max_total_chars=int(os.getenv("MAX_TOTAL_CHARS", "120000")),
+        max_total_chars=int(os.getenv("MAX_TOTAL_CHARS", "48000")),
         prompts_dir=root / "agents",
         output_dir=root / "output",
     )

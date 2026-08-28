@@ -6,6 +6,55 @@ from dataclasses import dataclass
 from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
 
+from .repo_context import normalize_rel_path
+
+
+def repair_json_string(raw: str) -> str:
+    """
+    Cleans and repairs common malformations in LLM JSON output:
+    - Extracts JSON payload from markdown fences or text wrappers
+    - Normalizes smart quotes (“ ” ‘ ’)
+    - Strips trailing commas before } and ]
+    - Removes zero-width or non-printable control characters
+    """
+    if not raw or not isinstance(raw, str):
+        return ""
+
+    s = raw.strip()
+
+    # 1. Extract content from inside ```json ... ``` or ``` ... ``` if present
+    fence_match = re.search(r"```(?:json)?\s*([\{\[].*?[\}\]])\s*```", s, re.DOTALL)
+    if fence_match:
+        s = fence_match.group(1).strip()
+    else:
+        s = re.sub(r"^```(?:json)?\s*", "", s)
+        s = re.sub(r"\s*```$", "", s).strip()
+
+    # 2. Extract outermost { ... } or [ ... ] if wrapped with surrounding text
+    first_brace = s.find("{")
+    first_bracket = s.find("[")
+    if first_brace != -1 or first_bracket != -1:
+        start_candidates = [idx for idx in [first_brace, first_bracket] if idx != -1]
+        start = min(start_candidates)
+        last_brace = s.rfind("}")
+        last_bracket = s.rfind("]")
+        end = max(last_brace, last_bracket)
+        if end > start:
+            s = s[start:end+1]
+
+    # 3. Normalize smart quotes to standard JSON double quotes
+    s = s.replace("“", '"').replace("”", '"').replace("„", '"').replace("‟", '"')
+    s = s.replace("‘", "'").replace("’", "'")
+
+    # 4. Remove trailing commas before } or ]
+    for _ in range(4):
+        s = re.sub(r",\s*([\]\}])", r"\1", s)
+
+    # 5. Remove non-standard control characters (keep \t, \n, \r)
+    s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", s)
+
+    return s.strip()
+
 
 _PLACEHOLDERS = {
     "n/a",
@@ -100,11 +149,79 @@ class ReviewerFinalFindingLLM(BaseModel):
     confidence: Literal["high", "medium", "low"] = "medium"
 
 
-class ReviewerFindingDispositionLLM(BaseModel):
-    source_finding_id: str
-    disposition: Literal["accepted", "merged", "rejected", "needs_verification"] = "accepted"
-    final_finding_id: str | None = None
-    reason: str = ""
+class ReviewerUnresolvedSourceLLM(BaseModel):
+    source_finding_ids: list[str] = Field(default_factory=list)
+    disposition: Literal["rejected", "needs_verification"] = "rejected"
+    reason: str = Field(default="")
+
+    @field_validator("disposition", mode="before")
+    @classmethod
+    def normalize_disposition(cls, v: Any) -> str:
+        if isinstance(v, str):
+            v_l = v.lower().strip()
+            if "reject" in v_l or "descart" in v_l or "rechaz" in v_l:
+                return "rejected"
+            if "verif" in v_l or "duda" in v_l or "pendient" in v_l:
+                return "needs_verification"
+        return "rejected"
+
+    @field_validator("source_finding_ids", mode="before")
+    @classmethod
+    def normalize_source_ids(cls, v: Any) -> list[str]:
+        if isinstance(v, str):
+            cleaned = v.strip()
+            if cleaned and cleaned.lower() not in _PLACEHOLDERS:
+                return [cleaned]
+            return []
+        if isinstance(v, (list, tuple, set)):
+            return [
+                str(item).strip()
+                for item in v
+                if str(item).strip() and str(item).strip().lower() not in _PLACEHOLDERS
+            ]
+        return []
+
+
+class ReviewerContradictionLLM(BaseModel):
+    source_finding_ids: list[str] = Field(default_factory=list)
+    description: str = Field(default="")
+
+    @field_validator("source_finding_ids", mode="before")
+    @classmethod
+    def normalize_source_ids(cls, v: Any) -> list[str]:
+        if isinstance(v, str):
+            cleaned = v.strip()
+            if cleaned and cleaned.lower() not in _PLACEHOLDERS:
+                return [cleaned]
+            return []
+        if isinstance(v, (list, tuple, set)):
+            return [
+                str(item).strip()
+                for item in v
+                if str(item).strip() and str(item).strip().lower() not in _PLACEHOLDERS
+            ]
+        return []
+
+
+class ReviewerDiscardedClaimLLM(BaseModel):
+    source_finding_ids: list[str] = Field(default_factory=list)
+    reason: str = Field(default="")
+
+    @field_validator("source_finding_ids", mode="before")
+    @classmethod
+    def normalize_source_ids(cls, v: Any) -> list[str]:
+        if isinstance(v, str):
+            cleaned = v.strip()
+            if cleaned and cleaned.lower() not in _PLACEHOLDERS:
+                return [cleaned]
+            return []
+        if isinstance(v, (list, tuple, set)):
+            return [
+                str(item).strip()
+                for item in v
+                if str(item).strip() and str(item).strip().lower() not in _PLACEHOLDERS
+            ]
+        return []
 
 
 class ReviewerLLMOutput(BaseModel):
@@ -112,9 +229,9 @@ class ReviewerLLMOutput(BaseModel):
     v1_readiness: Literal["ready", "not_ready", "needs_verification"] = "needs_verification"
     v1_readiness_reason: str = Field(default="")
     final_findings: list[ReviewerFinalFindingLLM] = Field(default_factory=list)
-    dispositions: list[ReviewerFindingDispositionLLM] = Field(default_factory=list)
-    contradictions: list[str] = Field(default_factory=list)
-    discarded_claims: list[str] = Field(default_factory=list)
+    unresolved_sources: list[ReviewerUnresolvedSourceLLM] = Field(default_factory=list)
+    contradictions: list[ReviewerContradictionLLM | str] = Field(default_factory=list)
+    discarded_claims: list[ReviewerDiscardedClaimLLM | str] = Field(default_factory=list)
     recommended_order: list[str] = Field(default_factory=list)
     required_testing: list[str] = Field(default_factory=list)
     required_docs: list[str] = Field(default_factory=list)
@@ -181,15 +298,17 @@ class Finding(BaseModel):
     @classmethod
     def normalize_files(cls, v: Any) -> list[str]:
         if isinstance(v, str):
-            if v.strip() and v.strip().lower() not in _PLACEHOLDERS:
-                return [v.strip()]
+            cleaned = normalize_rel_path(v)
+            if cleaned and cleaned.lower() not in _PLACEHOLDERS:
+                return [cleaned]
             return []
         if isinstance(v, (list, tuple, set)):
-            return [
-                str(item).strip()
-                for item in v
-                if str(item).strip() and str(item).strip().lower() not in _PLACEHOLDERS
-            ]
+            result = []
+            for item in v:
+                cleaned = normalize_rel_path(str(item))
+                if cleaned and cleaned.lower() not in _PLACEHOLDERS:
+                    result.append(cleaned)
+            return result
         return []
 
     @field_validator("source_finding_ids", mode="before")
@@ -226,11 +345,11 @@ class Finding(BaseModel):
             return False
 
         if files_included is not None:
-            inc_set = set(files_included)
-            inv_set = set(known_inventory) if known_inventory is not None else inc_set
+            inc_set = {normalize_rel_path(f) for f in files_included if f}
+            inv_set = {normalize_rel_path(f) for f in known_inventory if f} if known_inventory is not None else inc_set
 
             for f in self.files:
-                f_clean = f.strip()
+                f_clean = normalize_rel_path(f)
                 if not f_clean:
                     continue
                 if f_clean not in inc_set:
@@ -479,11 +598,15 @@ class ReviewerReport(BaseModel):
         accounting: AccountingSummary | None = None,
         specialist_statuses: dict[str, str] | None = None,
     ) -> str:
-        readiness_badge = {
-            "ready": "🟢 Ready for V1",
-            "not_ready": "🔴 Not Ready for V1 (Release Blockers Present)",
-            "needs_verification": "🟡 Needs Verification",
-        }.get(self.v1_readiness, "🟡 Needs Verification")
+        if self.v1_readiness == "ready":
+            readiness_badge = "🟢 Ready for V1"
+        elif self.v1_readiness == "not_ready":
+            if len(self.release_blockers) > 0:
+                readiness_badge = "🔴 Not Ready for V1 (Release Blockers Present)"
+            else:
+                readiness_badge = "🔴 Not Ready for V1 (Essential Work Pending)"
+        else:
+            readiness_badge = "🟡 Needs Verification"
 
         lines = [
             f"# Agent Team Final Audit Report — {repo_name}",
@@ -724,6 +847,245 @@ def compute_accounting_summary(
     )
 
 
+def _log_dropped_finding(run_ctx: Any, diag: dict[str, Any]) -> None:
+    try:
+        log_file = getattr(run_ctx, "log_file", None)
+        if log_file:
+            msg = f"REVIEWER FINAL FINDING DROPPED: title='{diag.get('title')}', source_ids={diag.get('source_ids')}, reason='{diag.get('reason')}'"
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+    except OSError:
+        pass
+
+
+def validate_and_filter_reviewer_findings(
+    raw_final_findings: list[Any],
+    specialist_reports: list[AgentReport],
+    run_ctx: Any = None,
+) -> tuple[list[Finding], list[dict[str, Any]]]:
+    """
+    Validates and filters Reviewer final findings based on validated specialist source evidence.
+    
+    Principles:
+    - Specialist findings already passed Evidence-First validation with files actually read.
+    - Reviewer trusts this validated evidence to consolidate.
+    - Final finding's allowed files = union of files from its cited source findings.
+    - Reviewer cannot introduce external files outside the union of its source findings' files.
+    - If files in final finding are empty or mismatched, Python normalizes them to allowed_source_files.
+    - If a final finding is dropped (e.g. empty title, zero sources, ungrounded), records diagnostic reason.
+    """
+    source_map: dict[str, Finding] = {}
+    for s in specialist_reports:
+        for f in s.findings:
+            if f.id:
+                source_map[f.id.lower().strip()] = f
+
+    dropped_diagnostics: list[dict[str, Any]] = []
+    valid_findings: list[Finding] = []
+
+    for f_in in raw_final_findings:
+        f_dict = f_in.model_dump() if hasattr(f_in, "model_dump") else (dict(f_in) if isinstance(f_in, dict) else f_in.__dict__)
+        source_ids = f_dict.get("source_finding_ids", [])
+        if isinstance(source_ids, str):
+            source_ids = [source_ids]
+        
+        # Check source IDs exist
+        valid_source_ids = [s.strip() for s in source_ids if str(s).strip().lower() in source_map]
+        if not valid_source_ids:
+            diag = {
+                "title": f_dict.get("title", ""),
+                "source_ids": source_ids,
+                "reason": "unknown_or_empty_sources",
+            }
+            dropped_diagnostics.append(diag)
+            if run_ctx:
+                _log_dropped_finding(run_ctx, diag)
+            continue
+
+        # Check meaningful title, evidence, impact, recommendation
+        if not is_meaningful_text(f_dict.get("title", ""), min_len=3):
+            diag = {
+                "title": f_dict.get("title", ""),
+                "source_ids": valid_source_ids,
+                "reason": "invalid_title",
+            }
+            dropped_diagnostics.append(diag)
+            if run_ctx:
+                _log_dropped_finding(run_ctx, diag)
+            continue
+
+        if not is_meaningful_text(f_dict.get("evidence", ""), min_len=3):
+            diag = {
+                "title": f_dict.get("title", ""),
+                "source_ids": valid_source_ids,
+                "reason": "invalid_evidence",
+            }
+            dropped_diagnostics.append(diag)
+            if run_ctx:
+                _log_dropped_finding(run_ctx, diag)
+            continue
+
+        # Allowed files = union of files from claimed sources
+        allowed_source_files: set[str] = set()
+        for sid in valid_source_ids:
+            sf = source_map[sid.lower().strip()]
+            for p in sf.files:
+                p_clean = normalize_rel_path(p)
+                if p_clean:
+                    allowed_source_files.add(p_clean)
+
+        # Normalize files
+        f_files = f_dict.get("files", [])
+        if isinstance(f_files, str):
+            f_files = [f_files]
+        normalized_files = [normalize_rel_path(p) for p in f_files if normalize_rel_path(p)]
+        
+        # If Reviewer files are a subset of allowed files, keep valid subset; otherwise normalize to allowed_source_files
+        clean_files = [p for p in normalized_files if p in allowed_source_files]
+        if not clean_files:
+            clean_files = sorted(allowed_source_files)
+
+        f_obj = Finding(
+            source_finding_ids=valid_source_ids,
+            priority=f_dict.get("priority", "P2"),
+            source_priority=f_dict.get("source_priority"),
+            reprioritization_reason=f_dict.get("reprioritization_reason"),
+            title=f_dict.get("title", "").strip()[:120],
+            evidence=f_dict.get("evidence", "").strip(),
+            files=clean_files,
+            impact=f_dict.get("impact", "").strip(),
+            recommendation=f_dict.get("recommendation", "").strip(),
+            confidence=f_dict.get("confidence", "medium"),
+        )
+        valid_findings.append(f_obj)
+
+    return valid_findings, dropped_diagnostics
+
+
+def validate_and_filter_reviewer_claims(
+    raw_contradictions: list[Any],
+    raw_discarded_claims: list[Any],
+    original_source_finding_ids: set[str],
+) -> tuple[list[str], list[str], bool]:
+    """
+    Validates that contradictions and discarded claims reference real source finding IDs.
+    Filters out any claims mentioning non-existent IDs (e.g. hallucinated frontend-003).
+    """
+    had_hallucination = False
+    clean_contradictions: list[str] = []
+    clean_discarded: list[str] = []
+
+    valid_id_set_lower = {sid.lower().strip() for sid in original_source_finding_ids if sid}
+    id_pattern = re.compile(r"\b([a-zA-Z]+-\d{3})\b", re.IGNORECASE)
+
+    for item in raw_contradictions:
+        s_ids = getattr(item, "source_finding_ids", []) or (item.get("source_finding_ids", []) if isinstance(item, dict) else [])
+        if isinstance(s_ids, str):
+            s_ids = [s_ids]
+        desc = getattr(item, "description", "") or (item.get("description", "") if isinstance(item, dict) else str(item))
+        
+        all_ids = set(s_ids) | set(id_pattern.findall(desc))
+        invalid_ids = [i for i in all_ids if i.lower().strip() not in valid_id_set_lower]
+        if invalid_ids:
+            had_hallucination = True
+            continue
+
+        if is_meaningful_text(desc, min_len=5):
+            clean_contradictions.append(desc.strip())
+
+    for item in raw_discarded_claims:
+        s_ids = getattr(item, "source_finding_ids", []) or (item.get("source_finding_ids", []) if isinstance(item, dict) else [])
+        if isinstance(s_ids, str):
+            s_ids = [s_ids]
+        reason = getattr(item, "reason", "") or (item.get("reason", "") if isinstance(item, dict) else str(item))
+        
+        all_ids = set(s_ids) | set(id_pattern.findall(reason))
+        invalid_ids = [i for i in all_ids if i.lower().strip() not in valid_id_set_lower]
+        if invalid_ids:
+            had_hallucination = True
+            continue
+
+        if is_meaningful_text(reason, min_len=5):
+            clean_discarded.append(reason.strip())
+
+    return clean_contradictions, clean_discarded, had_hallucination
+
+
+def determine_deterministic_readiness(
+    final_findings: list[Finding],
+    accounting: AccountingSummary,
+    has_failed_specialists: bool,
+    reviewer_suggested_reason: str = "",
+) -> tuple[Literal["ready", "not_ready", "needs_verification"], str]:
+    """
+    Imposes deterministic readiness consistency after all reconciliation and accounting.
+    
+    Rules:
+    1. If any specialist failed -> needs_verification
+    2. Else if final P0 > 0 -> not_ready (citing exact P0 count)
+    3. Else if needs_verification sources > 0 -> needs_verification (citing exact unverified count)
+    4. Else if final P1 > 0 -> not_ready (citing exact P1 count, NOT calling them P0 release blockers)
+    5. Else -> ready
+    """
+    p0_findings = [f for f in final_findings if f.priority == "P0"]
+    p1_findings = [f for f in final_findings if f.priority == "P1"]
+    needs_verif_count = accounting.needs_verification_count
+
+    if has_failed_specialists:
+        return "needs_verification", "Existen especialistas fallidos en la auditoría; V1 no puede considerarse lista."
+
+    if p0_findings:
+        return "not_ready", f"Existen {len(p0_findings)} release blockers P0 sin resolver que impiden el despliegue seguro."
+
+    if needs_verif_count > 0:
+        return "needs_verification", f"Existen {needs_verif_count} hallazgos fuente que requieren verificación adicional antes del release."
+
+    if p1_findings:
+        return "not_ready", f"Existen {len(p1_findings)} hallazgos P1 esenciales para una v1 sólida que deben completarse antes del lanzamiento."
+
+    return "ready", "No existen hallazgos bloqueantes P0 ni P1 pendientes; la base de código cumple los criterios para v1."
+
+
+def deduplicate_final_findings_sources(
+    final_findings: list[Finding],
+    original_source_finding_ids: set[str],
+) -> tuple[list[Finding], bool]:
+    """
+    Deduplicates source finding IDs across final findings deterministically.
+    Rules:
+    - A source_finding_id can only belong to ONE final finding (the first one encountered).
+    - If already assigned, remove it from subsequent final findings.
+    - If a final finding is left with 0 sources, discard it.
+    - Re-indexes final findings as reviewer-001, reviewer-002, ...
+    """
+    seen_sources: set[str] = set()
+    cleaned_findings: list[Finding] = []
+    had_duplicate = False
+
+    for f in final_findings:
+        unique_sources = []
+        for s_id in f.source_finding_ids:
+            s_clean = str(s_id).strip()
+            if s_clean in original_source_finding_ids:
+                if s_clean in seen_sources:
+                    had_duplicate = True
+                else:
+                    seen_sources.add(s_clean)
+                    unique_sources.append(s_clean)
+            else:
+                had_duplicate = True
+        f.source_finding_ids = unique_sources
+        if unique_sources and f.is_valid_finding():
+            cleaned_findings.append(f)
+        else:
+            had_duplicate = True
+
+    for idx, f in enumerate(cleaned_findings, 1):
+        f.id = f"reviewer-{idx:03d}"
+
+    return cleaned_findings, had_duplicate
+
+
 def reconcile_and_guarantee_accounting(
     report: ReviewerReport,
     specialist_reports: list[AgentReport],
@@ -753,21 +1115,25 @@ def reconcile_and_guarantee_accounting(
 
     if total_inputs == 0:
         summary = compute_accounting_summary(report, specialist_reports)
+        has_failed = any(s.status == "failed" for s in specialist_reports)
+        new_readiness, new_reason = determine_deterministic_readiness(
+            final_findings=report.final_findings,
+            accounting=summary,
+            has_failed_specialists=has_failed,
+            reviewer_suggested_reason=report.v1_readiness_reason,
+        )
+        report.v1_readiness = new_readiness
+        report.v1_readiness_reason = new_reason
         return report, summary
 
     had_recovery = False
 
-    # 2. Filter out malformed findings from final_findings (e.g. empty or placeholder titles)
-    valid_final: list[Finding] = []
-    for idx, f in enumerate(report.final_findings, 1):
-        if not f.id or not f.id.strip():
-            f.id = f"reviewer-{idx:03d}"
-        if f.is_valid_finding():
-            valid_final.append(f)
-        else:
-            had_recovery = True
+    # 2. Filter and deduplicate source finding IDs in final_findings
+    cleaned_final, had_dup_f = deduplicate_final_findings_sources(report.final_findings, original_source_finding_ids)
+    if had_dup_f or len(cleaned_final) != len(report.final_findings):
+        had_recovery = True
 
-    report.final_findings = valid_final
+    report.final_findings = cleaned_final
     final_by_id = {f.id: f for f in report.final_findings if f.id}
 
     # 3. Validate and clean existing dispositions
@@ -858,31 +1224,68 @@ def reconcile_and_guarantee_accounting(
         report.status = "repaired"
 
     final_summary = compute_accounting_summary(report, specialist_reports)
+
+    # Impose deterministic readiness consistency
+    has_failed = any(s.status == "failed" for s in specialist_reports)
+    new_readiness, new_reason = determine_deterministic_readiness(
+        final_findings=report.final_findings,
+        accounting=final_summary,
+        has_failed_specialists=has_failed,
+        reviewer_suggested_reason=report.v1_readiness_reason,
+    )
+    report.v1_readiness = new_readiness
+    report.v1_readiness_reason = new_reason
+
     return report, final_summary
 
 
 def _extract_json_candidate_strings(text: str) -> list[str]:
-    """Returns possible JSON substring candidates in priority order."""
+    """Returns possible JSON substring candidates in priority order, including repaired variants."""
     candidates = []
 
     # 1. Inside ```json ... ``` or ``` ... ```
     for m in re.finditer(r"```(?:json)?\s*([\{\[].*?[\}\]])\s*```", text, re.DOTALL):
-        candidates.append(m.group(1).strip())
+        cand = m.group(1).strip()
+        if cand:
+            candidates.append(cand)
+            rep = repair_json_string(cand)
+            if rep != cand:
+                candidates.append(rep)
 
     # 2. Outermost { ... }
     first_brace = text.find("{")
     last_brace = text.rfind("}")
     if first_brace != -1 and last_brace > first_brace:
-        candidates.append(text[first_brace:last_brace + 1].strip())
+        cand = text[first_brace:last_brace + 1].strip()
+        candidates.append(cand)
+        rep = repair_json_string(cand)
+        if rep != cand:
+            candidates.append(rep)
 
     # 3. Outermost [ ... ]
     first_bracket = text.find("[")
     last_bracket = text.rfind("]")
     if first_bracket != -1 and last_bracket > first_bracket:
-        candidates.append(text[first_bracket:last_bracket + 1].strip())
+        cand = text[first_bracket:last_bracket + 1].strip()
+        candidates.append(cand)
+        rep = repair_json_string(cand)
+        if rep != cand:
+            candidates.append(rep)
 
-    candidates.append(text.strip())
-    return candidates
+    clean_text = text.strip()
+    candidates.append(clean_text)
+    rep_clean = repair_json_string(clean_text)
+    if rep_clean != clean_text:
+        candidates.append(rep_clean)
+
+    # Deduplicate preserving order
+    seen = set()
+    unique_candidates = []
+    for c in candidates:
+        if c and c not in seen:
+            seen.add(c)
+            unique_candidates.append(c)
+    return unique_candidates
 
 
 def parse_agent_report(
@@ -1114,6 +1517,65 @@ def _extract_findings_from_markdown_text(text: str) -> list[Finding]:
     return findings
 
 
+def derive_dispositions_from_reviewer_output(
+    final_findings: list[Finding],
+    unresolved_sources: list[ReviewerUnresolvedSourceLLM] | list[dict[str, Any]],
+    original_source_finding_ids: set[str],
+) -> tuple[list[FindingDisposition], bool]:
+    """
+    Derives dispositions deterministically from final_findings and unresolved_sources.
+    
+    Rules:
+    - final_finding with len(source_finding_ids) == 1 -> 'accepted', final_finding_id = f.id
+    - final_finding with len(source_finding_ids) > 1 -> 'merged', final_finding_id = f.id
+    - unresolved_sources -> 'rejected' or 'needs_verification' with reason, final_finding_id = None
+    
+    Validation Invariants (No Duplicate Sources):
+    - A source_finding_id cannot appear in two different final_findings (deduplicated)
+    - A source_finding_id cannot appear in final_findings and unresolved_sources (final_finding takes precedence)
+    - A source_finding_id cannot appear twice in unresolved_sources
+    """
+    cleaned_final, had_duplicate = deduplicate_final_findings_sources(final_findings, original_source_finding_ids)
+    disposition_map: dict[str, FindingDisposition] = {}
+
+    # 1. Accepted / Merged derived from cleaned final_findings
+    for f in cleaned_final:
+        disp_type = "merged" if len(f.source_finding_ids) > 1 else "accepted"
+        for s_id in f.source_finding_ids:
+            disposition_map[s_id] = FindingDisposition(
+                source_finding_id=s_id,
+                disposition=disp_type,
+                final_finding_id=f.id,
+            )
+
+    # 2. Rejected / Needs_verification derived from unresolved_sources
+    for item in unresolved_sources:
+        disp = getattr(item, "disposition", None) or (item.get("disposition") if isinstance(item, dict) else "rejected")
+        reason = getattr(item, "reason", "") or (item.get("reason", "") if isinstance(item, dict) else "")
+        source_ids = getattr(item, "source_finding_ids", []) or (item.get("source_finding_ids", []) if isinstance(item, dict) else [])
+        if isinstance(source_ids, str):
+            source_ids = [source_ids]
+
+        if not is_meaningful_text(reason):
+            reason = "Reviewer classified this source finding as unresolved."
+
+        for s_id in source_ids:
+            s_clean = str(s_id).strip()
+            if s_clean not in original_source_finding_ids:
+                continue
+            if s_clean in disposition_map:
+                had_duplicate = True
+                continue
+            disposition_map[s_clean] = FindingDisposition(
+                source_finding_id=s_clean,
+                disposition=disp if disp in {"rejected", "needs_verification"} else "rejected",
+                reason=reason,
+                final_finding_id=None,
+            )
+
+    return list(disposition_map.values()), had_duplicate
+
+
 def parse_reviewer_report(
     raw_text: str,
     specialist_reports: list[AgentReport],
@@ -1124,15 +1586,39 @@ def parse_reviewer_report(
     """
     parsed_report: ReviewerReport | None = None
 
+    orig_ids: set[str] = set()
+    for s in specialist_reports:
+        s_role = s.agent.lower().strip() if s.agent else "spec"
+        for idx, f in enumerate(s.findings, 1):
+            f.id = f"{s_role}-{idx:03d}"
+            orig_ids.add(f.id)
+
     if raw_text and raw_text.strip():
         # Try direct parse
         try:
             data = json.loads(raw_text.strip())
             if isinstance(data, dict):
                 data["agent"] = "reviewer"
+                raw_final = data.get("final_findings", [])
+                valid_final, dropped_diags = validate_and_filter_reviewer_findings(raw_final, specialist_reports)
+                for idx, f in enumerate(valid_final, 1):
+                    f.id = f"reviewer-{idx:03d}"
+                clean_contras, clean_discards, had_halluc = validate_and_filter_reviewer_claims(
+                    data.get("contradictions", []),
+                    data.get("discarded_claims", []),
+                    orig_ids,
+                )
+                data["final_findings"] = [f.model_dump() for f in valid_final]
+                data["contradictions"] = clean_contras
+                data["discarded_claims"] = clean_discards
+                unres_s = data.get("unresolved_sources", [])
+                derived_disps, had_dup = derive_dispositions_from_reviewer_output(valid_final, unres_s, orig_ids)
+                if not data.get("dispositions"):
+                    data["dispositions"] = [d.model_dump() for d in derived_disps]
                 parsed_report = ReviewerReport.model_validate(data)
                 parsed_report.raw_output = raw_text
-                parsed_report.status = "valid" if retries == 0 else "repaired"
+                had_mod = bool(retries > 0 or dropped_diags or had_halluc or had_dup)
+                parsed_report.status = "valid" if not had_mod else "repaired"
                 parsed_report.retries = retries
         except Exception:
             pass
@@ -1145,6 +1631,22 @@ def parse_reviewer_report(
                     data = json.loads(cand)
                     if isinstance(data, dict):
                         data["agent"] = "reviewer"
+                        raw_final = data.get("final_findings", [])
+                        valid_final, _ = validate_and_filter_reviewer_findings(raw_final, specialist_reports)
+                        for idx, f in enumerate(valid_final, 1):
+                            f.id = f"reviewer-{idx:03d}"
+                        clean_contras, clean_discards, _ = validate_and_filter_reviewer_claims(
+                            data.get("contradictions", []),
+                            data.get("discarded_claims", []),
+                            orig_ids,
+                        )
+                        data["final_findings"] = [f.model_dump() for f in valid_final]
+                        data["contradictions"] = clean_contras
+                        data["discarded_claims"] = clean_discards
+                        unres_s = data.get("unresolved_sources", [])
+                        derived_disps, _ = derive_dispositions_from_reviewer_output(valid_final, unres_s, orig_ids)
+                        if not data.get("dispositions"):
+                            data["dispositions"] = [d.model_dump() for d in derived_disps]
                         parsed_report = ReviewerReport.model_validate(data)
                         parsed_report.raw_output = raw_text
                         parsed_report.status = "repaired"

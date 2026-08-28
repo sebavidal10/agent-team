@@ -463,7 +463,7 @@ class TestModelsAndRun(unittest.TestCase):
                 mock_structured_llm = MagicMock()
 
                 def mock_structured_side_effect(messages):
-                    from agent_team.models import ReviewerFinalFindingLLM, ReviewerFindingDispositionLLM, ReviewerLLMOutput, SpecialistFindingLLM, SpecialistLLMOutput
+                    from agent_team.models import ReviewerFinalFindingLLM, ReviewerLLMOutput, SpecialistFindingLLM, SpecialistLLMOutput
                     msg_str = str(messages)
                     if "reviewer" in msg_str.lower() or "tech lead" in msg_str.lower():
                         return ReviewerLLMOutput(
@@ -481,13 +481,7 @@ class TestModelsAndRun(unittest.TestCase):
                                     recommendation="Fix",
                                 )
                             ],
-                            dispositions=[
-                                ReviewerFindingDispositionLLM(
-                                    source_finding_id="architect-001",
-                                    disposition="accepted",
-                                    reason="Aceptado por Tech Lead.",
-                                )
-                            ],
+                            unresolved_sources=[],
                         )
                     return SpecialistLLMOutput(
                         summary="Specialist summary sustantivo del código auditado.",
@@ -1073,8 +1067,8 @@ class TestModelsAndRun(unittest.TestCase):
     def test_llm_schemas_do_not_contain_pipeline_fields(self):
         """8 & 9. SpecialistLLMOutput y ReviewerLLMOutput no piden al LLM campos del pipeline."""
         from agent_team.models import (
-            ReviewerFindingDispositionLLM,
             ReviewerLLMOutput,
+            ReviewerUnresolvedSourceLLM,
             SpecialistFindingLLM,
             SpecialistLLMOutput,
         )
@@ -1093,6 +1087,8 @@ class TestModelsAndRun(unittest.TestCase):
         self.assertNotIn("status", rev_fields)
         self.assertNotIn("retries", rev_fields)
         self.assertNotIn("raw_output", rev_fields)
+        self.assertNotIn("dispositions", rev_fields)
+        self.assertIn("unresolved_sources", rev_fields)
 
     def test_reviewer_retries_and_attempt_telemetry(self):
         """10, 11, 16. Telemetry and retry counter tracking per attempt."""
@@ -1136,12 +1132,12 @@ class TestModelsAndRun(unittest.TestCase):
             self.assertEqual(settings_custom.num_ctx, 8192)
 
         # Role context budgets
-        self.assertEqual(ROLE_CHAR_LIMITS["architect"], 30000)
-        self.assertEqual(ROLE_CHAR_LIMITS["backend"], 35000)
-        self.assertEqual(ROLE_CHAR_LIMITS["frontend"], 35000)
-        self.assertEqual(ROLE_CHAR_LIMITS["testing"], 30000)
-        self.assertEqual(ROLE_CHAR_LIMITS["docs"], 25000)
-        self.assertEqual(ROLE_CHAR_LIMITS["reviewer"], 25000)
+        self.assertEqual(ROLE_CHAR_LIMITS["architect"], 22000)
+        self.assertEqual(ROLE_CHAR_LIMITS["backend"], 24000)
+        self.assertEqual(ROLE_CHAR_LIMITS["frontend"], 24000)
+        self.assertEqual(ROLE_CHAR_LIMITS["testing"], 22000)
+        self.assertEqual(ROLE_CHAR_LIMITS["docs"], 18000)
+        self.assertEqual(ROLE_CHAR_LIMITS["reviewer"], 20000)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             base_out = Path(tmpdir)
@@ -1165,8 +1161,9 @@ class TestModelsAndRun(unittest.TestCase):
         """CLOSURE 1 — ReviewerLLMOutput con source_finding_ids produce final finding reviewer-001 y final_finding_id=reviewer-001."""
         from agent_team.models import (
             ReviewerFinalFindingLLM,
-            ReviewerFindingDispositionLLM,
             ReviewerLLMOutput,
+            ReviewerUnresolvedSourceLLM,
+            derive_dispositions_from_reviewer_output,
         )
 
         b_rep = AgentReport(agent="backend", findings=[Finding(priority="P0", title="Auth bug", evidence="auth.py:10", impact="Risk", recommendation="Fix")])
@@ -1187,24 +1184,20 @@ class TestModelsAndRun(unittest.TestCase):
                     recommendation="Fix",
                 )
             ],
-            dispositions=[
-                ReviewerFindingDispositionLLM(
-                    source_finding_id="backend-001",
-                    disposition="accepted",
-                    reason="Confirmado por Tech Lead.",
-                )
-            ],
+            unresolved_sources=[],
         )
 
         conv_findings = [Finding(**f.model_dump()) for f in dto.final_findings]
-        conv_dispositions = [FindingDisposition(**d.model_dump()) for d in dto.dispositions]
+        for idx, f in enumerate(conv_findings, 1):
+            f.id = f"reviewer-{idx:03d}"
+        derived_disps, _ = derive_dispositions_from_reviewer_output(conv_findings, dto.unresolved_sources, {"backend-001"})
         report = ReviewerReport(
             agent="reviewer",
             summary=dto.summary,
             v1_readiness=dto.v1_readiness,
             v1_readiness_reason=dto.v1_readiness_reason,
             final_findings=conv_findings,
-            dispositions=conv_dispositions,
+            dispositions=derived_disps,
         )
 
         reconciled, acc = reconcile_and_guarantee_accounting(report, [b_rep])

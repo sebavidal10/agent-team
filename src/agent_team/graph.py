@@ -17,10 +17,13 @@ from .models import (
     ReviewerLLMOutput,
     ReviewerReport,
     SpecialistLLMOutput,
+    derive_dispositions_from_reviewer_output,
     is_meaningful_text,
     parse_agent_report,
     parse_reviewer_report,
     reconcile_and_guarantee_accounting,
+    validate_and_filter_reviewer_claims,
+    validate_and_filter_reviewer_findings,
 )
 from .observability import ConsoleObserver
 from .repo_context import ROLE_CHAR_LIMITS, RepoSnapshot, build_global_inventory_tree, build_targeted_snapshot
@@ -55,16 +58,62 @@ def _read_prompt(settings: Settings, name: str) -> str:
     return (settings.prompts_dir / f"{name}.md").read_text(encoding="utf-8")
 
 
-def _extract_telemetry(raw_msg: Any, duration: float) -> dict[str, Any]:
+def _extract_telemetry(
+    raw_msg: Any,
+    duration: float,
+    num_ctx: int | None = None,
+    num_predict: int | None = None,
+    role: str | None = None,
+    run_ctx: RunContext | None = None,
+) -> dict[str, Any]:
     meta = {}
     if hasattr(raw_msg, "response_metadata") and isinstance(raw_msg.response_metadata, dict):
         meta = raw_msg.response_metadata
     elif isinstance(raw_msg, dict) and "response_metadata" in raw_msg:
         meta = raw_msg.get("response_metadata", {})
+
+    prompt_eval = meta.get("prompt_eval_count")
+    eval_count = meta.get("eval_count")
+    role_name = role.capitalize() if role else "Agent"
+
+    # Context usage warning (> 80%)
+    if prompt_eval and num_ctx and num_ctx > 0:
+        ratio = prompt_eval / num_ctx
+        if ratio > 0.8:
+            pct = int(round(ratio * 100))
+            msg = f"WARNING {role_name} input context is high: prompt uses {pct}% of context window ({prompt_eval}/{num_ctx})"
+            if run_ctx:
+                try:
+                    with open(run_ctx.log_file, "a", encoding="utf-8") as f:
+                        f.write(msg + "\n")
+                except OSError:
+                    pass
+
+    # Generation limit truncation warning
+    output_truncated = False
+    if eval_count is not None and num_predict is not None and eval_count >= num_predict:
+        output_truncated = True
+        msg = f"WARNING {role_name} output may have been truncated by generation limit ({eval_count}/{num_predict})"
+        if run_ctx:
+            try:
+                with open(run_ctx.log_file, "a", encoding="utf-8") as f:
+                    f.write(msg + "\n")
+            except OSError:
+                pass
+
+    remaining_context = None
+    if num_ctx is not None:
+        used = (prompt_eval or 0) + (eval_count or 0)
+        remaining_context = max(0, num_ctx - used)
+
     return {
         "duration_seconds": round(duration, 2),
-        "prompt_eval_count": meta.get("prompt_eval_count"),
-        "eval_count": meta.get("eval_count"),
+        "num_ctx": num_ctx,
+        "num_predict": num_predict,
+        "prompt_eval_count": prompt_eval,
+        "eval_count": eval_count,
+        "remaining_context": remaining_context,
+        "output_truncated": output_truncated,
         "prompt_eval_duration": meta.get("prompt_eval_duration"),
         "eval_duration": meta.get("eval_duration"),
         "total_duration": meta.get("total_duration"),
@@ -82,6 +131,8 @@ def build_graph(
         base_url=settings.base_url,
         temperature=0.1,
         num_ctx=settings.num_ctx,
+        num_predict=settings.num_predict,
+        timeout=settings.timeout_seconds,
     )
 
     if isinstance(snapshots, RepoSnapshot):
@@ -173,7 +224,7 @@ Si no existen hallazgos de severidad P0/P1/P2 sustentados con evidencia, usa 'fi
                     parsed = result.get("parsed") if isinstance(result, dict) else (result if isinstance(result, SpecialistLLMOutput) else None)
                     parsing_err = result.get("parsing_error") if isinstance(result, dict) else None
 
-                    att_meta = _extract_telemetry(raw_msg, att_dur)
+                    att_meta = _extract_telemetry(raw_msg, att_dur, num_ctx=settings.num_ctx, num_predict=settings.num_predict, role=role, run_ctx=run_ctx)
                     att_meta.update({
                         "attempt": 1,
                         "type": "primary_structured",
@@ -251,7 +302,7 @@ Si no existen hallazgos de severidad P0/P1/P2 sustentados con evidencia, usa 'fi
                                 r_parsed = retry_res.get("parsed") if isinstance(retry_res, dict) else None
                                 r_err = retry_res.get("parsing_error") if isinstance(retry_res, dict) else None
 
-                                r_meta = _extract_telemetry(r_raw_msg, r_dur)
+                                r_meta = _extract_telemetry(r_raw_msg, r_dur, num_ctx=settings.num_ctx, num_predict=settings.num_predict, role=role, run_ctx=run_ctx)
                                 r_meta.update({
                                     "attempt": 2,
                                     "type": "semantic_analysis_retry",
@@ -283,7 +334,10 @@ Si no existen hallazgos de severidad P0/P1/P2 sustentados con evidencia, usa 'fi
                         # Schema / JSON parsing failure
                         if observer:
                             observer.phase_done(role, "Ollama response received")
-                            observer.agent_warning(role, f"structured schema invalid ({parsing_err})\n            format recovery 1/1")
+                            if att_meta.get("output_truncated"):
+                                observer.agent_warning(role, f"output truncated by generation limit ({att_meta.get('eval_count')}/{settings.num_predict})\n            format recovery 1/1")
+                            else:
+                                observer.agent_warning(role, f"structured schema invalid ({parsing_err})\n            format recovery 1/1")
 
                 except Exception as structured_err:
                     if observer:
@@ -292,12 +346,11 @@ Si no existen hallazgos de severidad P0/P1/P2 sustentados con evidencia, usa 'fi
 
                 # Format recovery if schema/parsing failed (no full re-analysis)
                 if report is None and raw_text:
-                    retries = 1
-                    report, status_flag = parse_agent_report(role, raw_text, retries=1, files_included=files_inc, known_inventory=all_inv)
+                    report, status_flag = parse_agent_report(role, raw_text, retries=max(0, len(attempts_list) - 1), files_included=files_inc, known_inventory=all_inv)
                     report.agent = role
                     report.ensure_finding_ids()
                     report.raw_output = raw_text
-                    report.retries = 1
+                    report.retries = max(0, len(attempts_list) - 1)
                     report.attempts = attempts_list
                     if observer:
                         if status_flag in {"valid", "repaired"}:
@@ -313,7 +366,7 @@ Si no existen hallazgos de severidad P0/P1/P2 sustentados con evidencia, usa 'fi
                         findings=[],
                         open_questions=["Fallo en la estructuración de la respuesta."],
                         status="failed",
-                        retries=retries,
+                        retries=max(0, len(attempts_list) - 1),
                         raw_output=raw_text,
                         attempts=attempts_list,
                     )
@@ -324,7 +377,7 @@ Si no existen hallazgos de severidad P0/P1/P2 sustentados con evidencia, usa 'fi
                     report.status = "failed"
 
                 report.agent = role
-                report.retries = retries
+                report.retries = max(0, len(attempts_list) - 1)
                 report.attempts = attempts_list
                 report.ensure_finding_ids()
 
@@ -356,7 +409,7 @@ Si no existen hallazgos de severidad P0/P1/P2 sustentados con evidencia, usa 'fi
                     findings=[],
                     open_questions=[f"Error de ejecución: {err}"],
                     status="failed",
-                    retries=retries,
+                    retries=max(0, len(attempts_list) - 1),
                     raw_output=raw_text or str(err),
                     attempts=attempts_list,
                 )
@@ -426,12 +479,14 @@ Si no existen hallazgos de severidad P0/P1/P2 sustentados con evidencia, usa 'fi
             global_inv_tree = build_global_inventory_tree(root_dir)
             global_inv_set = set(global_inv_tree.splitlines())
 
+            original_source_finding_ids: set[str] = {f.id for f in all_input_findings if f.id}
+
             targeted_snap = build_targeted_snapshot(
                 root=root_dir,
                 target_files=target_files,
                 full_inventory_tree=global_inv_tree,
                 max_file_chars=settings.max_file_chars,
-                max_total_chars=ROLE_CHAR_LIMITS.get("reviewer", 25_000),
+                max_total_chars=ROLE_CHAR_LIMITS.get("reviewer", 20_000),
             )
 
             file_count = len(targeted_snap.files_included)
@@ -451,11 +506,10 @@ Si no existen hallazgos de severidad P0/P1/P2 sustentados con evidencia, usa 'fi
             report: ReviewerReport | None = None
             accounting_summary = None
             raw_text = ""
-            retries = 0
             attempts_list: list[dict[str, Any]] = []
 
             try:
-                # Phase 1: Aggregate specialist reports with IDs and status
+                # Phase 1: Aggregate specialist reports with clean compact format
                 if observer:
                     observer.phase_start("reviewer", f"Aggregating {total_input_count} specialist findings")
 
@@ -468,16 +522,29 @@ CONTENIDO DE ARCHIVOS CITADOS COMO EVIDENCIA POR ESPECIALISTAS ({file_count} arc
 {targeted_snap.content if targeted_snap.content else "No se citaron archivos de código específicos."}
 """
 
-                reports_summary = [
-                    f"### REPORTE AGENTE: {r.agent.upper()} (Estado: {r.status})\n{r.to_markdown()}\n"
-                    for r in valid_specialists
-                ]
-                full_specialists_context = "\n\n".join(reports_summary)
+                specialists_blocks = []
+                for r in valid_specialists:
+                    specialists_blocks.append(f"### ESPECIALISTA: {r.agent.upper()} (Estado: {r.status})")
+                    if r.summary:
+                        specialists_blocks.append(f"Resumen: {r.summary.strip()}")
+                    if r.findings:
+                        for f in r.findings:
+                            files_str = ", ".join(f.files) if f.files else "N/A"
+                            specialists_blocks.append(
+                                f"- **[{f.id}] [{f.priority}] {f.title}**\n"
+                                f"  Archivos: `{files_str}`\n"
+                                f"  Evidencia: {f.evidence}\n"
+                                f"  Impacto: {f.impact}\n"
+                                f"  Recomendación: {f.recommendation}"
+                            )
+                    else:
+                        reason = r.no_findings_reason or "Sin hallazgos reportados."
+                        specialists_blocks.append(f"- Sin hallazgos: {reason}")
+                    if r.open_questions:
+                        specialists_blocks.append("  Preguntas abiertas: " + "; ".join(r.open_questions))
+                    specialists_blocks.append("")
 
-                findings_id_list = "\n".join([
-                    f"- `{f.id}` [{f.priority}] {f.title} (Archivos: {', '.join(f.files) if f.files else 'N/A'})"
-                    for f in all_input_findings
-                ])
+                full_specialists_context = "\n".join(specialists_blocks)
 
                 if observer:
                     observer.phase_done("reviewer", f"{total_input_count} specialist findings aggregated")
@@ -497,14 +564,11 @@ OBJETIVO DEL USUARIO:
 ESTADO DE EJECUCIÓN DE ESPECIALISTAS:
 {chr(10).join(f"- {role.capitalize()}: {st}" for role, st in specialist_statuses.items())}
 
-LISTADO EXACTO DE HALLAZGOS A AUDITAR (Total: {total_input_count}):
-{findings_id_list}
-
-REPORTES DETALLADOS DE CADA ESPECIALISTA:
+HALLAZGOS DE ESPECIALISTAS A AUDITAR Y CONSOLIDAR (Total: {total_input_count}):
 {full_specialists_context}
 
 INSTRUCCIÓN TECH LEAD:
-Debes clasificar y dar disposición en 'dispositions' a CADA UNO de los {total_input_count} IDs de entrada ('accepted', 'merged', 'rejected', 'needs_verification') y construir 'final_findings' con 'source_finding_ids'. Genera el JSON completo con resumen ejecutivo y evaluación justificada de v1 readiness.
+Consolida los {total_input_count} hallazgos en 'final_findings' (asociando 'source_finding_ids') y clasifica en 'unresolved_sources' únicamente aquellos que descartes ('rejected') o requieran pruebas adicionales ('needs_verification'). Genera el JSON completo con resumen ejecutivo y evaluación justificada de v1 readiness.
 """),
                 ]
 
@@ -518,7 +582,7 @@ Debes clasificar y dar disposición en 'dispositions' a CADA UNO de los {total_i
                     parsed = result.get("parsed") if isinstance(result, dict) else (result if isinstance(result, ReviewerLLMOutput) else None)
                     parsing_err = result.get("parsing_error") if isinstance(result, dict) else None
 
-                    att_meta = _extract_telemetry(raw_msg, att_dur)
+                    att_meta = _extract_telemetry(raw_msg, att_dur, num_ctx=settings.num_ctx, num_predict=settings.num_predict, role="reviewer", run_ctx=run_ctx)
                     att_meta.update({
                         "attempt": 1,
                         "type": "primary_review",
@@ -528,38 +592,49 @@ Debes clasificar y dar disposición en 'dispositions' a CADA UNO de los {total_i
                     attempts_list.append(att_meta)
 
                     if isinstance(parsed, ReviewerLLMOutput):
-                        # Convert DTO to ReviewerReport and validate final findings against targeted context
-                        conv_findings = [
-                            Finding(**f.model_dump()) for f in parsed.final_findings
-                            if Finding(**f.model_dump()).is_valid_finding(targeted_files_set, global_inv_set)
-                        ]
-                        conv_dispositions = [FindingDisposition(**d.model_dump()) for d in parsed.dispositions]
+                        # Validate final findings against specialist source evidence (no false drops due to targeted snapshot char limits)
+                        conv_findings, dropped_diags = validate_and_filter_reviewer_findings(
+                            parsed.final_findings,
+                            valid_specialists,
+                            run_ctx=run_ctx,
+                        )
+                        for idx, f in enumerate(conv_findings, 1):
+                            f.id = f"reviewer-{idx:03d}"
+
+                        clean_contras, clean_discards, had_halluc = validate_and_filter_reviewer_claims(
+                            parsed.contradictions,
+                            parsed.discarded_claims,
+                            original_source_finding_ids,
+                        )
+
+                        derived_dispositions, had_dup = derive_dispositions_from_reviewer_output(
+                            conv_findings,
+                            parsed.unresolved_sources,
+                            original_source_finding_ids,
+                        )
+
+                        had_mod = bool(dropped_diags or had_halluc or had_dup)
+
                         report = ReviewerReport(
                             agent="reviewer",
                             summary=parsed.summary,
                             v1_readiness=parsed.v1_readiness,
                             v1_readiness_reason=parsed.v1_readiness_reason,
                             final_findings=conv_findings,
-                            dispositions=conv_dispositions,
-                            contradictions=parsed.contradictions,
-                            discarded_claims=parsed.discarded_claims,
+                            dispositions=derived_dispositions,
+                            contradictions=clean_contras,
+                            discarded_claims=clean_discards,
                             recommended_order=parsed.recommended_order,
                             required_testing=parsed.required_testing,
                             required_docs=parsed.required_docs,
                             v1_release_criteria=parsed.v1_release_criteria,
                             open_questions=parsed.open_questions,
                             raw_output=raw_text,
-                            status="valid",
+                            status="valid" if not had_mod else "repaired",
                             retries=0,
                             attempts=attempts_list,
                         )
                         report, accounting_summary = reconcile_and_guarantee_accounting(report, valid_specialists)
-
-                        # Enforce that audit with failed specialists cannot be READY
-                        if has_failed_specialists and report.v1_readiness == "ready":
-                            report.v1_readiness = "needs_verification"
-                            if "fallidos" not in report.v1_readiness_reason.lower():
-                                report.v1_readiness_reason = (report.v1_readiness_reason + " [Existen especialistas fallidos en la auditoría; V1 no puede considerarse lista]").strip()
 
                         # Check semantic quality
                         if not report.is_valid_report():
@@ -567,7 +642,6 @@ Debes clasificar y dar disposición en 'dispositions' a CADA UNO de los {total_i
                                 observer.phase_done("reviewer", "Ollama response received")
                                 observer.agent_warning("reviewer", "Reviewer output lacks substantive evaluation\n            review retry 1/1")
                             
-                            retries = 1
                             retry_messages = list(messages) + [
                                 ("assistant", raw_text),
                                 ("human", (
@@ -585,21 +659,35 @@ Debes clasificar y dar disposición en 'dispositions' a CADA UNO de los {total_i
                                 r_parsed = retry_res.get("parsed") if isinstance(retry_res, dict) else None
                                 r_err = retry_res.get("parsing_error") if isinstance(retry_res, dict) else None
 
-                                r_meta = _extract_telemetry(r_raw_msg, r_dur)
+                                r_meta = _extract_telemetry(r_raw_msg, r_dur, num_ctx=settings.num_ctx, num_predict=settings.num_predict, role="reviewer", run_ctx=run_ctx)
                                 r_meta.update({
                                     "attempt": 2,
                                     "type": "semantic_review_retry",
                                     "raw_output": r_raw_text,
                                     "parsing_error": str(r_err) if r_err else None,
-                                })
+                                    })
                                 attempts_list.append(r_meta)
 
                                 if isinstance(r_parsed, ReviewerLLMOutput):
-                                    r_conv_f = [
-                                        Finding(**f.model_dump()) for f in r_parsed.final_findings
-                                        if Finding(**f.model_dump()).is_valid_finding(targeted_files_set, global_inv_set)
-                                    ]
-                                    r_conv_d = [FindingDisposition(**d.model_dump()) for d in r_parsed.dispositions]
+                                    r_conv_f, _ = validate_and_filter_reviewer_findings(
+                                        r_parsed.final_findings,
+                                        valid_specialists,
+                                        run_ctx=run_ctx,
+                                    )
+                                    for idx, f in enumerate(r_conv_f, 1):
+                                        f.id = f"reviewer-{idx:03d}"
+
+                                    r_contras, r_discards, _ = validate_and_filter_reviewer_claims(
+                                        r_parsed.contradictions,
+                                        r_parsed.discarded_claims,
+                                        original_source_finding_ids,
+                                    )
+
+                                    r_conv_d, _ = derive_dispositions_from_reviewer_output(
+                                        r_conv_f,
+                                        r_parsed.unresolved_sources,
+                                        original_source_finding_ids,
+                                    )
                                     report = ReviewerReport(
                                         agent="reviewer",
                                         summary=r_parsed.summary,
@@ -607,8 +695,8 @@ Debes clasificar y dar disposición en 'dispositions' a CADA UNO de los {total_i
                                         v1_readiness_reason=r_parsed.v1_readiness_reason,
                                         final_findings=r_conv_f,
                                         dispositions=r_conv_d,
-                                        contradictions=r_parsed.contradictions,
-                                        discarded_claims=r_parsed.discarded_claims,
+                                        contradictions=r_contras,
+                                        discarded_claims=r_discards,
                                         recommended_order=r_parsed.recommended_order,
                                         required_testing=r_parsed.required_testing,
                                         required_docs=r_parsed.required_docs,
@@ -620,8 +708,6 @@ Debes clasificar y dar disposición en 'dispositions' a CADA UNO de los {total_i
                                         attempts=attempts_list,
                                     )
                                     report, accounting_summary = reconcile_and_guarantee_accounting(report, valid_specialists)
-                                    if has_failed_specialists and report.v1_readiness == "ready":
-                                        report.v1_readiness = "needs_verification"
                             except Exception:
                                 pass
 
@@ -635,14 +721,17 @@ Debes clasificar y dar disposición en 'dispositions' a CADA UNO de los {total_i
                 except Exception as structured_err:
                     if observer:
                         observer.phase_done("reviewer", "Ollama response received")
-                        observer.agent_warning("reviewer", f"structured reviewer output invalid ({structured_err})\n            retry 1/1")
+                        if att_meta.get("output_truncated"):
+                            observer.agent_warning("reviewer", f"reviewer output truncated by token limit ({att_meta.get('eval_count')}/{settings.num_predict})\n            recovery 1/1")
+                        else:
+                            observer.agent_warning("reviewer", f"structured reviewer output invalid ({structured_err})\n            recovery 1/1")
 
                 # If primary structured call failed, parse from raw_text or fallback
                 if report is None:
-                    retries = 1
-                    report, status_flag = parse_reviewer_report(raw_text, valid_specialists, retries=1)
+                    real_retries = max(0, len(attempts_list) - 1)
+                    report, status_flag = parse_reviewer_report(raw_text, valid_specialists, retries=real_retries)
                     report.raw_output = raw_text
-                    report.retries = 1
+                    report.retries = real_retries
                     report.attempts = attempts_list
                     report, accounting_summary = reconcile_and_guarantee_accounting(report, valid_specialists)
                     if has_failed_specialists and report.v1_readiness == "ready":
@@ -650,7 +739,7 @@ Debes clasificar y dar disposición en 'dispositions' a CADA UNO de los {total_i
                     if observer:
                         observer.phase_done("reviewer", f"Structured final plan {status_flag} ({accounting_summary.accounted_count}/{total_input_count} accounted)")
 
-                report.retries = retries
+                report.retries = max(0, len(attempts_list) - 1)
                 report.attempts = attempts_list
                 if accounting_summary is None:
                     report, accounting_summary = reconcile_and_guarantee_accounting(report, valid_specialists)
@@ -691,9 +780,9 @@ Debes clasificar y dar disposición en 'dispositions' a CADA UNO de los {total_i
                 duration = time.time() - t0
                 if observer:
                     observer.agent_failed("reviewer", str(err), duration)
-                report, _ = parse_reviewer_report("", valid_specialists, retries=retries)
+                report, _ = parse_reviewer_report("", valid_specialists, retries=max(0, len(attempts_list) - 1))
                 report.raw_output = raw_text or str(err)
-                report.retries = retries
+                report.retries = max(0, len(attempts_list) - 1)
                 report.attempts = attempts_list
                 report, accounting_summary = reconcile_and_guarantee_accounting(report, valid_specialists)
                 if has_failed_specialists and report.v1_readiness == "ready":
@@ -724,12 +813,17 @@ Debes clasificar y dar disposición en 'dispositions' a CADA UNO de los {total_i
             }
 
             return {
+                f"{role}_report": report,
+                role: raw_text,
+                "role_metrics": metrics,
+            } if False else {
                 "reviewer_report": report,
                 "reviewer": raw_text,
                 "role_metrics": metrics,
             }
 
         return node
+
 
     architect = call_specialist("architect")
     backend = call_specialist("backend")

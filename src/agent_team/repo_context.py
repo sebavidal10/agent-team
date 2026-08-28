@@ -1,7 +1,25 @@
-from __future__ import annotations
-
 from dataclasses import dataclass
 from pathlib import Path
+import re
+
+
+def normalize_rel_path(path_str: str) -> str:
+    """
+    Normalizes relative file paths:
+    - Strips whitespace, quotes, and backticks
+    - Converts backslashes to forward slashes
+    - Removes leading './' or '/'
+    - Resolves redundant slashes
+    """
+    if not path_str or not isinstance(path_str, str):
+        return ""
+    p = path_str.strip().strip("'\"`")
+    p = p.replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    p = p.lstrip("/")
+    p = re.sub(r"/+", "/", p)
+    return p.strip()
 
 
 IGNORE_DIRS = {
@@ -26,21 +44,21 @@ IMPORTANT_NAMES = {
 }
 
 ROLE_CHAR_LIMITS: dict[str, int] = {
-    "architect": 30_000,
-    "backend": 35_000,
-    "frontend": 35_000,
-    "testing": 30_000,
-    "docs": 25_000,
-    "reviewer": 25_000,
+    "architect": 22_000,
+    "backend": 24_000,
+    "frontend": 24_000,
+    "testing": 22_000,
+    "docs": 18_000,
+    "reviewer": 20_000,
 }
 
 ROLE_FILE_LIMITS: dict[str, int] = {
-    "architect": 40,
-    "backend": 50,
-    "frontend": 50,
-    "testing": 40,
-    "docs": 30,
-    "reviewer": 40,
+    "architect": 25,
+    "backend": 30,
+    "frontend": 30,
+    "testing": 25,
+    "docs": 20,
+    "reviewer": 25,
 }
 
 ROLE_KEYWORDS = {
@@ -371,8 +389,11 @@ def build_role_snapshots(
     }
 
 
-def build_global_inventory_tree(root: Path) -> str:
-    """Builds a complete lightweight inventory tree of all code/text files in the repository."""
+def build_global_inventory_tree(root: Path, max_lines: int = 200, max_chars: int = 6000) -> str:
+    """
+    Builds a lightweight inventory tree of all code/text files in the repository.
+    Protects context budget by bounding maximum lines/characters for large repos.
+    """
     root = root.expanduser().resolve()
     paths: list[str] = []
     for path in root.rglob("*"):
@@ -386,9 +407,20 @@ def build_global_inventory_tree(root: Path) -> str:
             continue
         if not _is_candidate(path):
             continue
-        paths.append(str(rel))
+        paths.append(normalize_rel_path(str(rel)))
     paths.sort()
-    return "\n".join(paths)
+
+    if len(paths) > max_lines:
+        truncated_paths = paths[:max_lines]
+        truncated_paths.append(f"... y {len(paths) - max_lines} archivos adicionales en el repositorio.")
+        tree_text = "\n".join(truncated_paths)
+    else:
+        tree_text = "\n".join(paths)
+
+    if len(tree_text) > max_chars:
+        tree_text = tree_text[:max_chars] + "\n... [ÁRBOL TRUNCADO POR LÍMITE DE CONTEXTO] ..."
+
+    return tree_text
 
 
 def build_targeted_snapshot(
@@ -408,9 +440,10 @@ def build_targeted_snapshot(
     total = 0
 
     valid_targets = [
-        f for f in sorted(target_files)
+        normalize_rel_path(f) for f in sorted(target_files)
         if f and f.lower() not in {"n/a", "none", "unknown", "null"}
     ]
+    valid_targets = [f for f in valid_targets if f]
 
     for rel_path_str in valid_targets:
         path = root / rel_path_str
