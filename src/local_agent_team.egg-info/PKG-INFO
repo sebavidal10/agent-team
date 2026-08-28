@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: local-agent-team
+Version: 0.1.0
+Summary: Equipo multiagente local para auditar y planificar mejoras de repositorios usando LangGraph + Ollama.
+Requires-Python: >=3.11
+Requires-Dist: langgraph
+Requires-Dist: langchain-ollama
+Requires-Dist: python-dotenv

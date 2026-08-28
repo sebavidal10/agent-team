@@ -1,0 +1,13 @@
+README.md
+pyproject.toml
+src/agent_team/__init__.py
+src/agent_team/config.py
+src/agent_team/graph.py
+src/agent_team/main.py
+src/agent_team/repo_context.py
+src/local_agent_team.egg-info/PKG-INFO
+src/local_agent_team.egg-info/SOURCES.txt
+src/local_agent_team.egg-info/dependency_links.txt
+src/local_agent_team.egg-info/entry_points.txt
+src/local_agent_team.egg-info/requires.txt
+src/local_agent_team.egg-info/top_level.txt

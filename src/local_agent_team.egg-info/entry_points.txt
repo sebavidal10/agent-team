@@ -1,0 +1,2 @@
+[console_scripts]
+agent-team = agent_team.main:main
