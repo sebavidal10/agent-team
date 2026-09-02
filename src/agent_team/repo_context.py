@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -40,98 +42,30 @@ IMPORTANT_NAMES = {
     "requirements.txt", "Dockerfile", "docker-compose.yml",
     "docker-compose.yaml", "compose.yml", "compose.yaml",
     "Makefile", "AGENTS.md", "CLAUDE.md", ".env.example",
-    ".env.sample", ".env.template",
+    ".env.sample", ".env.template", "pnpm-workspace.yaml",
+    "turbo.json", "nx.json", "biome.json", "drizzle.config.ts",
+    "drizzle.config.js", "schema.prisma", "tsconfig.json",
+    "vite.config.ts", "vite.config.js", "next.config.js",
+    "next.config.mjs", "next.config.ts",
 }
-
-ROLE_CHAR_LIMITS: dict[str, int] = {
-    "architect": 22_000,
-    "backend": 24_000,
-    "frontend": 24_000,
-    "testing": 22_000,
-    "docs": 18_000,
-    "reviewer": 20_000,
-}
-
-ROLE_FILE_LIMITS: dict[str, int] = {
-    "architect": 25,
-    "backend": 30,
-    "frontend": 30,
-    "testing": 25,
-    "docs": 20,
-    "reviewer": 25,
-}
-
-ROLE_KEYWORDS = {
-    "architect": {
-        "dirs": {"docs", ".agent", ".skill"},
-        "names": IMPORTANT_NAMES,
-        "contains": {
-            "architecture", "spec", "decision", "adr", "config",
-            "route", "schema", "model",
-        },
-    },
-    "backend": {
-        "dirs": {
-            "backend", "server", "api", "routes", "controllers",
-            "services", "models", "db", "database", "migrations",
-            "repositories",
-        },
-        "names": {
-            "package.json", "pyproject.toml", "requirements.txt",
-            "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
-            "compose.yml", "compose.yaml",
-        },
-        "contains": {
-            "api", "route", "controller", "service", "repository",
-            "migration", "schema", "model", "database", "auth",
-        },
-    },
-    "frontend": {
-        "dirs": {
-            "frontend", "web", "client", "ui", "components",
-            "pages", "views", "hooks", "store", "stores",
-        },
-        "names": {
-            "package.json", "vite.config.ts", "vite.config.js",
-            "tsconfig.json",
-        },
-        "contains": {
-            "component", "page", "view", "hook", "store",
-            "frontend", "client", "ui",
-        },
-    },
-    "testing": {
-        "dirs": {
-            "tests", "test", "__tests__", "e2e",
-            "integration", "unit", "spec",
-        },
-        "names": {
-            "vitest.config.ts", "vitest.config.js",
-            "jest.config.ts", "jest.config.js",
-            "playwright.config.ts", "playwright.config.js",
-            "package.json",
-        },
-        "contains": {
-            "test", "spec", "e2e", "integration",
-            "fixture", "mock",
-        },
-    },
-    "docs": {
-        "dirs": {
-            "docs", ".agent", ".skill",
-        },
-        "names": IMPORTANT_NAMES,
-        "contains": {
-            "readme", "spec", "architecture", "decision",
-            "adr", "documentation", "guide",
-        },
-    },
-}
-
 
 LOCKFILE_NAMES = {
     "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "pnpm-lock.yml",
     "poetry.lock", "Cargo.lock", "Gemfile.lock", "composer.lock",
+}
+
+ROLE_CHAR_LIMITS: dict[str, int] = {
+    "profiler": 30_000,
+    "planner": 35_000,
+    "builder": 45_000,
+    "reviewer": 35_000,
+}
+
+ROLE_FILE_LIMITS: dict[str, int] = {
+    "profiler": 25,
+    "planner": 35,
+    "builder": 15,
+    "reviewer": 25,
 }
 
 
@@ -149,332 +83,168 @@ class RepoSnapshot:
 def _is_candidate(path: Path) -> bool:
     if path.name in LOCKFILE_NAMES:
         return False
-
     if path.name in IMPORTANT_NAMES:
         return True
-
     if path.name.startswith(".env") and path.name != ".env":
         return True
-
     return path.suffix.lower() in TEXT_SUFFIXES
 
 
-def _matches_role(path: Path, root: Path, role: str) -> bool:
-    rules = ROLE_KEYWORDS.get(role)
+def build_global_inventory_tree(root: Path, max_depth: int = 4) -> str:
+    """Builds a bounded inventory tree of the repository."""
+    lines: list[str] = []
 
-    if not rules:
-        return True
+    def _walk(current: Path, depth: int, prefix: str = ""):
+        if depth > max_depth or len(lines) >= 350:
+            return
+        try:
+            entries = sorted(current.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        except (PermissionError, OSError):
+            return
 
-    rel = path.relative_to(root)
-    parts_lower = {part.lower() for part in rel.parts}
-    name_lower = path.name.lower()
-    path_lower = str(rel).lower()
+        for entry in entries:
+            if entry.name in IGNORE_DIRS or entry.name.startswith(".git"):
+                continue
+            rel = entry.relative_to(root)
+            rel_str = str(rel).replace("\\", "/")
+            if entry.is_dir():
+                lines.append(f"{prefix}{entry.name}/")
+                _walk(entry, depth + 1, prefix + "  ")
+            else:
+                lines.append(f"{prefix}{entry.name}")
 
-    if role == "testing":
-        # Testing needs both test files and key production implementation files
-        if parts_lower & rules["dirs"] or path.name in rules["names"]:
-            return True
-        if any(keyword in path_lower or keyword in name_lower for keyword in rules["contains"]):
-            return True
-        # Also include core source files so testing can audit implementation vs test coverage
-        if "src" in parts_lower or "app" in parts_lower or "lib" in parts_lower:
-            return path.suffix.lower() in {".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs"}
-        return False
-
-    if path.name in rules["names"]:
-        return True
-
-    if parts_lower & rules["dirs"]:
-        return True
-
-    return any(keyword in path_lower or keyword in name_lower
-               for keyword in rules["contains"])
+    _walk(root, 1)
+    return "\n".join(lines[:350])
 
 
-def _priority(path: Path, root: Path, role: str) -> tuple:
-    rel = path.relative_to(root)
-    parts_lower = {part.lower() for part in rel.parts}
-    name_lower = path.name.lower()
-    path_lower = str(rel).lower()
-
-    is_test_file = (
-        any(t in name_lower for t in [".test.", ".spec.", "_test.", "_spec."])
-        or bool(parts_lower & {"tests", "test", "__tests__", "e2e", "integration", "unit", "spec"})
-    )
-
-    score = 100
-
-    if path.name in IMPORTANT_NAMES:
-        score -= 30
-
-    if role == "backend":
-        if is_test_file:
-            score += 25  # Prioritize production implementation before tests
-        else:
-            if any(k in path_lower for k in ["route", "controller", "api", "endpoint"]):
-                score -= 60
-            elif any(k in path_lower for k in ["service", "model", "repository", "schema", "db", "database"]):
-                score -= 50
-            elif "migration" in path_lower:
-                score -= 20
-            elif any(k in path_lower for k in ["auth", "middleware", "config"]):
-                score -= 30
-
-    elif role == "frontend":
-        if is_test_file:
-            score += 25  # Prioritize UI components and pages before tests
-        else:
-            if any(k in path_lower for k in ["page", "view", "component", "ui"]):
-                score -= 60
-            elif any(k in path_lower for k in ["hook", "store", "state", "context", "client", "router", "app."]):
-                score -= 50
-            elif any(k in path_lower for k in ["config", "util", "helper"]):
-                score -= 20
-
-    elif role == "testing":
-        if any(k in name_lower for k in ["vitest", "jest", "playwright", "cypress"]):
-            score -= 60
-        elif is_test_file:
-            score -= 50  # Existing tests
-        else:
-            # Production files included to compare coverage
-            score -= 35
-
-    elif role == "architect":
-        if any(k in path_lower for k in ["doc", "adr", "spec", "architecture"]):
-            score -= 60
-        elif any(k in path_lower for k in ["config", "schema", "main.", "index.", "app."]):
-            score -= 40
-
-    elif role == "docs":
-        if any(k in path_lower for k in [".env.example", ".env.sample", ".env.template"]):
-            score -= 75
-        elif any(k in path_lower for k in ["readme", "doc", "spec", "guide", "adr"]):
-            score -= 60
-        elif any(k in path_lower for k in ["package.json", "pyproject.toml", "docker-compose", "dockerfile"]):
-            score -= 40
-
-    if rel.parts and rel.parts[0] in {"src", "app", "lib"}:
-        score -= 10
-
-    return (score, len(rel.parts), str(rel))
-
-
-def build_snapshot(
+def build_profiler_snapshot(
     root: Path,
-    max_files: int | None = None,
-    max_file_chars: int = 12000,
-    max_total_chars: int | None = None,
-    role: str | None = None,
+    max_file_chars: int = 12_000,
+    max_total_chars: int = 30_000,
 ) -> RepoSnapshot:
-    root = root.expanduser().resolve()
-
-    if not root.is_dir():
-        raise ValueError(f"No existe el directorio: {root}")
-
-    role_key = role or "architect"
-    effective_max_chars = max_total_chars or ROLE_CHAR_LIMITS.get(role_key, 60_000)
-    effective_max_files = max_files or ROLE_FILE_LIMITS.get(role_key, 50)
+    """
+    Selects root manifests, configurations, env examples, and READMEs
+    for the Profiler to understand stack and conventions.
+    """
+    tree = build_global_inventory_tree(root)
+    files_included: list[str] = []
+    content_blocks: list[str] = []
+    total_chars = 0
+    candidates_total = 0
+    candidates_discarded = 0
 
     candidates: list[Path] = []
+    for p in root.rglob("*"):
+        if any(ignored in p.parts for ignored in IGNORE_DIRS):
+            continue
+        if p.is_file() and _is_candidate(p):
+            candidates.append(p)
 
-    for path in root.rglob("*"):
+    candidates_total = len(candidates)
+
+    def _priority(p: Path) -> tuple:
+        rel = p.relative_to(root)
+        name = p.name.lower()
+        is_root = len(rel.parts) == 1
+        is_manifest = name in {"package.json", "pyproject.toml", "requirements.txt", "cargo.toml"}
+        is_readme = "readme" in name
+        is_config = name in IMPORTANT_NAMES or name.endswith(".json") or name.endswith(".config.ts")
+        return (not is_root, not is_manifest, not is_readme, not is_config, len(str(rel)))
+
+    sorted_candidates = sorted(candidates, key=_priority)
+
+    for p in sorted_candidates:
+        rel_str = normalize_rel_path(str(p.relative_to(root)))
         try:
-            rel = path.relative_to(root)
-        except ValueError:
-            continue
-
-        if any(part in IGNORE_DIRS for part in rel.parts):
-            continue
-
-        if not path.is_file():
-            continue
-
-        if not _is_candidate(path):
-            continue
-
-        if role and not _matches_role(path, root, role):
-            continue
-
-        candidates.append(path)
-
-    total_candidates = len(candidates)
-
-    candidates.sort(
-        key=lambda p: _priority(
-            p,
-            root=root,
-            role=role_key,
-        )
-    )
-
-    # Lightweight inventory tree includes all matched candidate paths
-    inventory_tree_lines = [str(p.relative_to(root)) for p in candidates]
-
-    candidates = candidates[:effective_max_files]
-
-    included: list[str] = []
-    chunks: list[str] = []
-    total = 0
-
-    for path in candidates:
-        rel = path.relative_to(root)
-
-        try:
-            text = path.read_text(
-                encoding="utf-8",
-                errors="replace",
-            )
+            text = p.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
 
         if len(text) > max_file_chars:
-            text = (
-                text[:max_file_chars]
-                + "\n...[TRUNCADO]..."
-            )
+            text = text[:max_file_chars] + "\n\n[... CONTENIDO TRUNCADO POR LÍMITE DE TAMAÑO ...]"
 
-        block = (
-            f"\n\n===== FILE: {rel} =====\n"
-            f"{text}"
-        )
-
-        if total + len(block) > effective_max_chars:
-            # Candidate does not fit in remaining budget; continue evaluating remaining smaller candidates
+        block = f"--- ARCHIVO: {rel_str} ---\n{text}\n"
+        if total_chars + len(block) > max_total_chars and files_included:
+            candidates_discarded += 1
             continue
 
-        chunks.append(block)
-        included.append(str(rel))
-        total += len(block)
-
-    discarded = total_candidates - len(included)
+        files_included.append(rel_str)
+        content_blocks.append(block)
+        total_chars += len(block)
+        if len(files_included) >= ROLE_FILE_LIMITS.get("profiler", 25):
+            break
 
     return RepoSnapshot(
         root=root,
-        tree="\n".join(inventory_tree_lines),
-        content="".join(chunks),
-        files_included=included,
-        total_chars=total,
-        candidates_total=total_candidates,
-        candidates_discarded=max(0, discarded),
+        tree=tree,
+        content="\n".join(content_blocks),
+        files_included=files_included,
+        total_chars=total_chars,
+        candidates_total=candidates_total,
+        candidates_discarded=candidates_total - len(files_included),
     )
 
 
-def build_role_snapshots(
+def build_planner_snapshot(
     root: Path,
-    max_files: int | None = None,
-    max_file_chars: int = 12000,
-    max_total_chars: int | None = None,
-    role_char_limits: dict[str, int] | None = None,
-) -> dict[str, RepoSnapshot]:
-    roles = [
-        "architect",
-        "backend",
-        "frontend",
-        "testing",
-        "docs",
-    ]
-
-    char_limits = role_char_limits or ROLE_CHAR_LIMITS
-
-    return {
-        role: build_snapshot(
-            root=root,
-            max_files=max_files,
-            max_file_chars=max_file_chars,
-            max_total_chars=char_limits.get(role, max_total_chars),
-            role=role,
-        )
-        for role in roles
-    }
+    max_file_chars: int = 12_000,
+    max_total_chars: int = 35_000,
+) -> RepoSnapshot:
+    """Builds snapshot for the Planner with tree and architecture files."""
+    return build_profiler_snapshot(root, max_file_chars=max_file_chars, max_total_chars=max_total_chars)
 
 
-def build_global_inventory_tree(root: Path, max_lines: int = 200, max_chars: int = 6000) -> str:
-    """
-    Builds a lightweight inventory tree of all code/text files in the repository.
-    Protects context budget by bounding maximum lines/characters for large repos.
-    """
-    root = root.expanduser().resolve()
-    paths: list[str] = []
-    for path in root.rglob("*"):
-        try:
-            rel = path.relative_to(root)
-        except ValueError:
-            continue
-        if any(part in IGNORE_DIRS for part in rel.parts):
-            continue
-        if not path.is_file():
-            continue
-        if not _is_candidate(path):
-            continue
-        paths.append(normalize_rel_path(str(rel)))
-    paths.sort()
-
-    if len(paths) > max_lines:
-        truncated_paths = paths[:max_lines]
-        truncated_paths.append(f"... y {len(paths) - max_lines} archivos adicionales en el repositorio.")
-        tree_text = "\n".join(truncated_paths)
-    else:
-        tree_text = "\n".join(paths)
-
-    if len(tree_text) > max_chars:
-        tree_text = tree_text[:max_chars] + "\n... [ÁRBOL TRUNCADO POR LÍMITE DE CONTEXTO] ..."
-
-    return tree_text
-
-
-def build_targeted_snapshot(
+def build_builder_snapshot(
     root: Path,
-    target_files: set[str] | list[str],
-    full_inventory_tree: str,
-    max_file_chars: int = 12000,
-    max_total_chars: int = 25000,
+    target_files: list[str],
+    full_tree: str = "",
+    max_file_chars: int = 25_000,
+    max_total_chars: int = 45_000,
 ) -> RepoSnapshot:
     """
-    Builds an evidence-targeted snapshot for Reviewer containing only files cited by specialists,
-    preventing bloated 50k+ char context and token bottlenecks.
+    Builds a targeted snapshot containing the EXACT contents of the files to be patched.
     """
-    root = root.expanduser().resolve()
-    included: list[str] = []
-    chunks: list[str] = []
-    total = 0
+    if not full_tree:
+        full_tree = build_global_inventory_tree(root)
 
-    valid_targets = [
-        normalize_rel_path(f) for f in sorted(target_files)
-        if f and f.lower() not in {"n/a", "none", "unknown", "null"}
-    ]
-    valid_targets = [f for f in valid_targets if f]
+    files_included: list[str] = []
+    content_blocks: list[str] = []
+    total_chars = 0
+    discarded = 0
 
-    for rel_path_str in valid_targets:
-        path = root / rel_path_str
-        if not path.is_file():
+    norm_targets = [normalize_rel_path(p) for p in target_files if p]
+
+    for rel_str in norm_targets:
+        if not rel_str:
+            continue
+        file_path = root / rel_str
+        if not file_path.exists() or not file_path.is_file():
+            # Could be a file to create
             continue
 
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
+            text = file_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
 
         if len(text) > max_file_chars:
-            text = text[:max_file_chars] + "\n...[TRUNCADO]..."
+            text = text[:max_file_chars] + "\n\n[... CONTENIDO TRUNCADO ...]"
 
-        block = f"\n\n===== FILE: {rel_path_str} =====\n{text}"
-        if total + len(block) > max_total_chars:
+        block = f"--- ARCHIVO FUENTE ACTUAL: {rel_str} ---\n{text}\n"
+        if total_chars + len(block) > max_total_chars and files_included:
+            discarded += 1
             continue
 
-        chunks.append(block)
-        included.append(rel_path_str)
-        total += len(block)
-
-    discarded = len(valid_targets) - len(included)
+        files_included.append(rel_str)
+        content_blocks.append(block)
+        total_chars += len(block)
 
     return RepoSnapshot(
         root=root,
-        tree=full_inventory_tree,
-        content="".join(chunks),
-        files_included=included,
-        total_chars=total,
-        candidates_total=len(valid_targets),
-        candidates_discarded=max(0, discarded),
+        tree=full_tree,
+        content="\n".join(content_blocks) if content_blocks else "No se especificaron o no existen archivos fuente previos.",
+        files_included=files_included,
+        total_chars=total_chars,
+        candidates_total=len(norm_targets),
+        candidates_discarded=discarded,
     )
-

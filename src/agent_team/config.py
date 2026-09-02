@@ -19,6 +19,11 @@ class Settings:
     max_total_chars: int
     prompts_dir: Path
     output_dir: Path
+    reviewer_model: str = ""
+    interactive: bool = False
+
+    def get_reviewer_model(self) -> str:
+        return self.reviewer_model or self.model
 
 
 def load_settings() -> Settings:
@@ -26,8 +31,11 @@ def load_settings() -> Settings:
 
     root = Path(__file__).resolve().parents[2]
 
+    base_model = os.getenv("AGENT_MODEL", "qwen2.5-coder:7b")
+    reviewer_model = os.getenv("REVIEWER_MODEL", base_model)
+
     return Settings(
-        model=os.getenv("AGENT_MODEL", "qwen2.5-coder:7b"),
+        model=base_model,
         base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
         num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "16384")),
         num_predict=int(os.getenv("OLLAMA_NUM_PREDICT", "4096")),
@@ -37,4 +45,8 @@ def load_settings() -> Settings:
         max_total_chars=int(os.getenv("MAX_TOTAL_CHARS", "48000")),
         prompts_dir=root / "agents",
         output_dir=root / "output",
+        reviewer_model=reviewer_model,
+        interactive=False,
     )
+
+

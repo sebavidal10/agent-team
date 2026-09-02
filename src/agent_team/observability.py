@@ -11,7 +11,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from .models import AgentReport, Finding, ReviewerReport
 from .repo_context import RepoSnapshot
 
 
@@ -139,7 +138,7 @@ class AgentRow:
 
 class ConsoleObserver:
     FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
-    ROLES = ("architect", "backend", "frontend", "testing", "docs", "reviewer")
+    ROLES = ("profiler", "planner", "builder", "reviewer")
 
     def __init__(
         self,
@@ -339,41 +338,43 @@ class ConsoleObserver:
         now_str = datetime.now().strftime("%H:%M:%S")
         self._write_log(f"[{now_str}] ✗ {role.upper()} FAILED (duration: {duration:.1f}s, reason: {reason})")
 
+    def finish_agent(
+        self,
+        role: str,
+        duration: float = 0.0,
+        findings_count: int = 0,
+        status: str = "valid",
+    ) -> None:
+        with self._lock:
+            row = self.rows.get(role)
+            if row:
+                row.state = "Done"
+                row.time_seconds = duration
+                row.findings_count = findings_count
+                row.output_status = status
+                row.is_completed = True
+
+            if self.active_role == role:
+                self.active_role = None
+
     def complete_agent(
         self,
         role: str,
-        report: AgentReport | ReviewerReport,
-        duration: float,
-        files_count: int,
-        context_chars: int,
+        report: Any = None,
+        duration: float = 0.0,
+        files_count: int = 0,
+        context_chars: int = 0,
         discarded_files: int = 0,
         candidates_total: int | None = None,
     ) -> None:
         with self._lock:
             row = self.rows.get(role)
-            if isinstance(report, ReviewerReport):
-                findings_list = report.final_findings
-                p0 = len(report.p0)
-                p1 = len(report.p1)
-                p2 = len(report.p2)
-            else:
-                findings_list = report.findings
-                p0 = sum(1 for f in findings_list if f.priority == "P0")
-                p1 = sum(1 for f in findings_list if f.priority == "P1")
-                p2 = sum(1 for f in findings_list if f.priority in {"P2", "P3"})
-
             if row:
                 row.state = "Done"
                 row.time_seconds = duration
                 row.files_used = files_count
                 row.files_candidates = candidates_total if candidates_total else (files_count + discarded_files)
                 row.context_chars = context_chars
-                row.findings_count = len(findings_list)
-                row.p0 = p0
-                row.p1 = p1
-                row.p2 = p2
-                row.output_status = report.status
-                row.retries = report.retries
                 row.is_completed = True
 
             if self.active_role == role:
@@ -552,45 +553,38 @@ class ConsoleObserver:
         model: str,
         total_duration: float,
         role_metrics: dict[str, dict[str, Any]],
-        reviewer_report: ReviewerReport | None,
-        run_dir: Path,
-        final_report_path: Path,
+        patches_count: int = 0,
+        review_status: str = "approved",
+        run_dir: Path | None = None,
+        final_guide_path: Path | None = None,
+        reviewer_report: Any | None = None,
+        final_report_path: Path | None = None,
     ) -> None:
         self._stop_refresh_thread()
+
+        target_guide = final_guide_path or final_report_path or Path("final-guide.md")
 
         with self._lock:
             self.active_role = None
 
-            # Final metrics update
             for role, m in role_metrics.items():
                 if role in self.rows:
                     row = self.rows[role]
-                    row.time_seconds = m.get("duration_seconds", row.time_seconds)
-                    row.findings_count = m.get("findings", row.findings_count)
-                    row.output_status = m.get("structured_output", row.output_status)
-                    row.retries = m.get("retries", row.retries)
+                    row.time_seconds = m.get("duration", row.time_seconds)
+                    row.findings_count = m.get("files_count", row.findings_count)
+                    row.output_status = m.get("status", row.output_status)
                     row.is_completed = True
                     row.state = "Done"
-                    if role == "reviewer" and reviewer_report:
-                        row.p0 = len(reviewer_report.p0)
-                        row.p1 = len(reviewer_report.p1)
-                        row.p2 = len(reviewer_report.p2)
 
             if self.is_tty:
-                # Render final table with active line cleared
                 self._render_dashboard()
 
         clock_str = format_duration_clock(total_duration)
-        findings_total = len(reviewer_report.final_findings) if reviewer_report else sum(r.findings_count for r in self.rows.values())
-        p0 = len(reviewer_report.p0) if reviewer_report else sum(r.p0 for r in self.rows.values())
-        p1 = len(reviewer_report.p1) if reviewer_report else sum(r.p1 for r in self.rows.values())
-        p2 = len(reviewer_report.p2) if reviewer_report else sum(r.p2 for r in self.rows.values())
 
-        # Concise summary lines below the final table
         summary_lines = [
-            f"{self.colors.green('✓')} {self.colors.bold('Audit complete')} · {self.colors.bold(clock_str)}",
-            f"{self.colors.bold(str(findings_total))} findings · {self.colors.red('P0')}:{p0}  {self.colors.yellow('P1')}:{p1}  {self.colors.gray('P2')}:{p2}",
-            f"Report: {final_report_path}",
+            f"{self.colors.green('✓')} {self.colors.bold('Improvement pipeline complete')} · {self.colors.bold(clock_str)}",
+            f"{self.colors.bold(str(patches_count))} patches generated · Review: {self.colors.green(review_status.upper())}",
+            f"Delivery Guide: {target_guide}",
             "",
         ]
 
@@ -599,6 +593,7 @@ class ConsoleObserver:
 
         self._write_log(
             f"--- RUN COMPLETED: {datetime.now().isoformat()} (duration: {total_duration:.1f}s, "
-            f"findings: {findings_total}, P0:{p0} P1:{p1} P2:{p2}) ---"
+            f"patches: {patches_count}, status: {review_status}) ---"
         )
-        self._write_log(f"Final Report: {final_report_path}")
+        self._write_log(f"Final Guide: {target_guide}")
+

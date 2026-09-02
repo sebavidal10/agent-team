@@ -1,28 +1,45 @@
-# Local Agent Team (v0.1.2)
+# Local Improvement Team (v0.2.0)
 
-Equipo multiagente local basado en **LangGraph + Ollama + Pydantic** para auditar repositorios y definir planes de acción concretos hacia una v1 terminable y sólida.
+Equipo multiagente local basado en **LangGraph + Ollama + Pydantic** diseñado para **analizar proyectos locales y generar planes de mejora con parches de código (`.diff`) listos para aplicar**.
 
-Esta versión es **estrictamente de solo lectura (READ-ONLY)** y deliberadamente segura:
-- Lee un repositorio local sin modificarlo ni copiar su código fuente.
-- No ejecuta comandos shell en el repositorio analizado.
-- No modifica Git ni usa worktrees.
-- No utiliza APIs externas ni envía telemetría.
-- Presupuestos de contexto diferenciados por rol para evitar desbordes y alucinaciones.
-- Forzado de formato JSON nativo con Ollama JSON Schema + 1 retry controlado.
-- Parser de recuperación multietapa tolerante a fallos.
+Optimizado específicamente para modelos de código locales como **`qwen2.5-coder:7b`** ejecutándose en Ollama de forma 100% privada, sin enviar código a la nube ni modificar el repositorio sin tu consentimiento.
 
 ---
 
-## 👥 Equipo de Agentes y Límites de Contexto
+## 👥 Equipo de Agentes y Flujo de Trabajo
 
-| Rol | Enfoque | Límite Caracteres | Límite Archivos |
-| :--- | :--- | :--- | :--- |
-| **Architect** | Arquitectura global, límites de capas, riesgos y alcance v1 | 55.000 chars | 40 archivos |
-| **Backend** | Endpoints, modelos de datos, validación, auth, contratos y seguridad | 65.000 chars | 50 archivos |
-| **Frontend** | Flujos de usuario, estados UI (loading/error/empty), componentes | 65.000 chars | 50 archivos |
-| **Testing** | Cobertura de tests, casos límite y suite mínima para v1 | 50.000 chars | 40 archivos |
-| **Docs** | README, especificaciones, `.env.example`, contratos y guías | 40.000 chars | 30 archivos |
-| **Reviewer (Tech Lead)** | Deduplica hallazgos, detecta contradicciones y consolida plan v1 | 45.000 chars | 40 archivos |
+```
+[Proyecto Local + Objetivo]
+           │
+           ▼
+  1. 🔍 PROFILER (Discovery & Arquitectura)
+     Analiza manifests y configuraciones para extraer el stack,
+     frameworks y convenciones de código (Project Blueprint).
+           │
+           ▼
+  2. 📋 PLANNER (Estratega de Mejoras)
+     Cruza tu objetivo con el Blueprint y define 2 a 4 mejoras
+     de alto impacto con archivos objetivo delimitados.
+           │
+           ▼
+  3. 🛠️ BUILDER (Generador de Parches)
+     Escribe el código real y genera los parches en formato
+     unified diff (.diff / git diff) respetando el estilo del proyecto.
+           │
+           ▼
+  4. 🧐 REVIEWER (Tech Lead & Control de Calidad)
+     Valida la integridad de los parches y elabora la guía
+     paso a paso para aplicarlos con 'git apply' y verificarlos.
+```
+
+---
+
+## 🔒 Modo Asistido (Seguro y en Solo Lectura)
+
+- **Inspección Segura**: Lee tu proyecto local en solo lectura. No modifica ningún archivo del repositorio ni crea ramas sin que tú lo decidas.
+- **Parches Listos en `output/`**: Cada ejecución deposita los archivos `.diff` individuales en la carpeta `output/run-YYYYMMDD-HHMMSS/patches/`.
+- **Control Total**: Tú decides qué parches aplicar revisándolos previamente o ejecutando `git apply`.
+- **Zero Telemetría**: Ejecución 100% local con Ollama en `localhost:11434`.
 
 ---
 
@@ -30,13 +47,10 @@ Esta versión es **estrictamente de solo lectura (READ-ONLY)** y deliberadamente
 
 - Python 3.11+
 - Ollama en ejecución local (`http://localhost:11434`)
-- Un modelo local descargado (por ejemplo, `qwen2.5-coder:7b` o similar)
-
-Verificación rápida:
-```bash
-python3 --version
-ollama list
-```
+- Modelo descargado en Ollama (recomendado: `qwen2.5-coder:7b`):
+  ```bash
+  ollama pull qwen2.5-coder:7b
+  ```
 
 ---
 
@@ -59,73 +73,63 @@ cp .env.example .env
 
 ## 📊 3. Estructura de Salida por Ejecución
 
-Cada auditoría genera un directorio único y versionado en `output/`:
+Cada corrida genera un directorio versionado en `output/`:
 
 ```text
 output/run-YYYYMMDD-HHMMSS/
-    ├── run.log                 # Log completo con métricas de observabilidad
-    ├── manifest.json           # Metadatos del run (tiempos, archivos, conteos, statuses)
-    ├── final-report.md         # Informe final consolidado del Tech Lead
-    ├── context/                # Listado de archivos analizados por cada rol
-    │   ├── architect-files.txt
-    │   ├── backend-files.txt
-    │   ├── frontend-files.txt
-    │   ├── testing-files.txt
-    │   └── docs-files.txt
+    ├── run.log                 # Registro de tiempos, métricas y fases
+    ├── manifest.json           # Metadatos del run (stack, mejoras, duraciones)
+    ├── project-blueprint.md    # Radiografía técnica del proyecto (lenguaje, framework, convenciones)
+    ├── improvement-plan.md     # Detalle de las mejoras planificadas
+    ├── final-guide.md          # Guía paso a paso para aplicar y probar los cambios
     ├── reports/                # Reportes estructurados en formato JSON (Pydantic)
-    │   ├── architect.json
-    │   ├── backend.json
-    │   ├── frontend.json
-    │   ├── testing.json
-    │   ├── docs.json
+    │   ├── blueprint.json
+    │   ├── plan.json
+    │   ├── builder.json
     │   └── reviewer.json
-    └── markdown/               # Reportes individuales de cada agente en Markdown
-        ├── architect.md
-        ├── backend.md
-        ├── frontend.md
-        ├── testing.md
-        ├── docs.md
-        └── reviewer.md
+    └── patches/                # Parches de código individuales listos para aplicar
+        ├── patch-01-auth_controller.diff
+        └── patch-02-validation_schema.diff
 ```
 
 ---
 
-## ⚡ 4. Ejecución de una Auditoría Real
+## ⚡ 4. Uso del Equipo
 
-### Comando CLI:
+### Ejecución básica:
 ```bash
-agent-team /RUTA/A/TU_REPOSITORIO \
-  --goal "Auditar el proyecto y definir una ruta concreta para terminar una v1 sólida."
+agent-team /ruta/a/tu-proyecto-local \
+  --goal "Mejorar el manejo de errores y validaciones en las rutas de autenticación."
 ```
 
-### O mediante módulo Python:
+### Opciones avanzadas:
 ```bash
-python -m agent_team.main /RUTA/A/TU_REPOSITORIO \
-  --goal "Auditar el proyecto y definir una ruta concreta para terminar una v1 sólida."
+# Con modelo diferenciado para el Reviewer (ej. llama3.1:8b)
+agent-team /ruta/a/tu-proyecto-local --reviewer-model llama3.1:8b
+
+# Modo interactivo para confirmar la aplicación de parches en terminal
+agent-team /ruta/a/tu-proyecto-local --interactive
+```
+
+### Cómo aplicar los parches generados:
+```bash
+# 1. En la carpeta de tu proyecto local, crea una rama de trabajo:
+git checkout -b mejora-local
+
+# 2. Aplica el parche generado por el equipo:
+git apply /ruta/a/agent-team/output/run-YYYYMMDD-HHMMSS/patches/patch-01-auth_controller.diff
+
+# 3. Revisa los cambios con git diff y corre tus tests:
+git diff
+npm test
 ```
 
 ---
 
-## 🧪 5. Suite de Pruebas Automatizadas
+## 🧪 5. Suite de Pruebas
 
-Todos los tests son determinísticos y no requieren tener Ollama activo:
+Todas las pruebas son deterministas y no requieren tener Ollama activo:
 
 ```bash
 python -m unittest discover -s tests -v
 ```
-
-Cubre:
-- Validación y normalización de esquemas Pydantic (`Finding`, `AgentReport`, `ReviewerReport`).
-- Extracción y reparación tolerante de JSON (fences, texto circundante, fragmentos, listas sin wrapper).
-- Presupuesto de contexto por rol y métricas de candidatos descartados.
-- Observabilidad en terminal (estados `valid`, `repaired`, `fallback`, spinner, progreso, `NO_COLOR`).
-- Manejo de retries controlados (máximo 1 reintento sin loops infinitos).
-
----
-
-## 🔮 Próximas Fases (v0.2+)
-
-En futuras versiones con capacidades de escritura se incorporarán:
-1. Git worktrees aislados por agente.
-2. Herramientas de edición y ejecución controlada de tests / linters.
-3. Ciclo de corrección iterativo con aprobación humana obligatoria antes de mergear.
